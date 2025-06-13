@@ -3,6 +3,9 @@ Build and push an image to ECR
 
 
 ## Example Usage
+env:
+  REPOSITORY_NAME: "myvisausa/crm-api"
+  ECR_REPOSITORY: "349514606126.dkr.ecr.us-east-1.amazonaws.com/myvisausa/crm-api"
 
   build-backend:
     runs-on: ubuntu-latest
