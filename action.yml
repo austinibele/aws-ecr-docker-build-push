@@ -1,0 +1,227 @@
+name: 'Build Docker Image'
+description: 'Builds and pushes a Docker image to ECR'
+inputs:
+  repository_name:
+    description: 'Repository name'
+    required: true
+  image_prefix:
+    description: 'Prefix for the image tag (e.g., "backend", "frontend")'
+    required: true
+  build_directory:
+    description: 'Directory containing the Dockerfile'
+    required: true
+  context_directory:
+    description: 'The build context directory'
+    required: false
+    default: '.'
+  dockerfile:
+    description: 'Dockerfile to use'
+    required: false
+    default: 'Dockerfile'
+  build_args:
+    description: 'Additional build arguments for Docker build'
+    required: false
+    default: ''
+  build_env:
+    description: 'JSON array of environment variables to use during build, format: [{"name": "VAR_NAME", "value": "value"}]'
+    required: false
+    default: '[]'
+  filter_pattern:
+    description: 'JSON array of patterns to check for changed files'
+    required: true
+  aws_access_key_id:
+    description: 'AWS Access Key ID'
+    required: true
+  aws_secret_access_key:
+    description: 'AWS Secret Access Key'
+    required: true
+  github_token:
+    description: 'GitHub token with permissions to read workflow runs'
+    required: true
+  pat:
+    description: 'Personal Access Token for Git operations'
+    required: true
+
+outputs:
+  image_uri:
+    description: "The URI of the built or cached image"
+    value: ${{ steps.build-or-use.outputs.image_uri }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        # Full history is required so that HEAD^ exists when comparing submodule SHAs
+        fetch-depth: 0
+
+    - name: Configure Git # Required because we are using submodules
+      shell: bash
+      run: |
+        git config --global user.email "my.email@gmail.com"
+        git config --global user.name "myname"
+        git config --global url.https://${{ inputs.pat }}@github.com/.insteadOf https://github.com/
+
+    - name: Checkout submodules
+      shell: bash
+      run: git submodule update --init --recursive
+
+    # ------------------------------------------------------------------
+    # Detect whether files **inside** the sub-module that contains the
+    # build_directory have changed between the previous commit of the
+    # super-project and the current HEAD.  This compensates for the fact
+    # that dorny/paths-filter can only see the gitlink entry of the
+    # sub-module and not the paths inside it.
+    #
+    # If any file under the chosen build_directory has changed, the step
+    # sets `sub_source_changes=true` in its outputs so the image is
+    # rebuilt even when the super-project itself did not touch files in
+    # that directory directly (i.e. only the sub-module pointer moved).
+    # ------------------------------------------------------------------
+    - name: Detect sub-module source changes
+      id: sub_changes
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # First component of the build_directory (e.g. "myvisa" for
+        # "myvisa/backend") – assumed to be the sub-module root.
+        SUBMODULE_DIR="$(echo "${{ inputs.build_directory }}" | cut -d'/' -f1)"
+
+        # Determine the previous commit SHA to diff against. For push
+        # events this is provided by GitHub, otherwise fall back to HEAD^.
+        PREV_COMMIT="${{ github.event.before }}"
+        if [ -z "$PREV_COMMIT" ] || ! git cat-file -e "$PREV_COMMIT^{commit}" 2>/dev/null; then
+          PREV_COMMIT="$(git rev-parse HEAD^)"
+        fi
+
+        # Resolve the sub-module SHAs recorded in the two super-project commits.
+        OLD_SUB_SHA=""
+        if git rev-parse "$PREV_COMMIT:$SUBMODULE_DIR" > /dev/null 2>&1; then
+          OLD_SUB_SHA="$(git rev-parse "$PREV_COMMIT:$SUBMODULE_DIR")"
+        fi
+        NEW_SUB_SHA="$(git rev-parse "HEAD:$SUBMODULE_DIR")"
+
+        # If we cannot determine the old SHA, assume changes.
+        if [ -z "$OLD_SUB_SHA" ]; then
+          echo "sub_source_changes=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Make sure we have both commits locally for the diff (they may not be fetched yet).
+        git -C "$SUBMODULE_DIR" fetch --quiet origin "$OLD_SUB_SHA" "$NEW_SUB_SHA" || true
+
+        # Compare only the build_directory inside the sub-module.
+        if git -C "$SUBMODULE_DIR" diff --quiet "$OLD_SUB_SHA" "$NEW_SUB_SHA" -- "${{ inputs.build_directory }}"; then
+          echo "sub_source_changes=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "sub_source_changes=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Filter Changed Files
+      uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        base: ${{ github.ref }}
+        ref: ${{ github.ref }}
+        filters: |
+          source_changes:
+            ${{ inputs.filter_pattern }}
+
+    - name: Check Previous Run Status
+      id: check-status
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        set +e  # Don't exit on error
+        # First get the previous workflow run
+        PREVIOUS_RUN_ID=$(gh api \
+          repos/${{ github.repository }}/actions/runs \
+          --jq ".workflow_runs[] | select(.head_branch == \"${{ github.ref_name }}\" and .id != ${{ github.run_id }}) | .id" \
+          | head -n 1 || echo "")
+        if [ -z "$PREVIOUS_RUN_ID" ]; then
+          echo "No previous workflow run found or API call failed"
+          echo "previous_failed=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        # Now get the jobs for that specific run
+        PREVIOUS_STATUS=$(gh api \
+          repos/${{ github.repository }}/actions/runs/$PREVIOUS_RUN_ID/jobs \
+          --jq ".jobs[] | select(.name | contains(\"build-${{ inputs.image_prefix }}\")) | .conclusion" \
+          | head -n 1 || echo "")
+        if [ "$PREVIOUS_STATUS" = "failure" ]; then
+          echo "Previous build failed"
+          echo "previous_failed=true" >> $GITHUB_OUTPUT
+        else
+          echo "Previous build succeeded or status check failed"
+          echo "previous_failed=false" >> $GITHUB_OUTPUT
+        fi
+        exit 0  # Ensure we don't fail the build
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ inputs.aws_access_key_id }}
+        aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Check for Existing Image
+      id: check-image
+      shell: bash
+      run: |
+        # Include environment in the image tag search
+        if [[ "${{ github.ref_name }}" == "main" ]]; then
+          ENV_TAG="prod"
+        else
+          ENV_TAG="dev"
+        fi
+        LATEST_IMAGE_TAG=$(aws ecr describe-images \
+          --repository-name ${{ inputs.repository_name }} \
+          --query "sort_by(imageDetails[?imageTags[?starts_with(@, '${{ inputs.image_prefix }}-${ENV_TAG}')]], &imagePushedAt)[-1].imageTags" \
+          --region ${{ env.AWS_REGION }} \
+          --output json  | jq -r '.[0]')
+        if [ "$LATEST_IMAGE_TAG" != "null" ] && [ "$LATEST_IMAGE_TAG" != "None" ]; then
+          echo "has_existing_image=true" >> $GITHUB_OUTPUT
+          echo "latest_image_uri=${{ env.ECR_REPOSITORY }}:$LATEST_IMAGE_TAG" >> $GITHUB_OUTPUT
+        else
+          echo "has_existing_image=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Build or Use Existing Image
+      id: build-or-use
+      shell: bash
+      run: |
+        if [[ "${{ github.ref_name }}" == "main" ]]; then
+          ENV_TAG="prod"
+        else
+          ENV_TAG="dev"
+        fi
+        if [[ "${{ steps.filter.outputs.source_changes }}" == "true" ]] || \
+           [[ "${{ steps.sub_changes.outputs.sub_source_changes }}" == "true" ]] || \
+           [[ "${{ steps.check-image.outputs.has_existing_image }}" == "false" ]] || \
+           [[ "${{ steps.check-status.outputs.previous_failed }}" == "true" ]]; then
+          echo "Building new image..."
+          # Parse build environment variables and create --build-arg commands
+          BUILD_ENV_ARGS=""
+          if [ -n "${{ inputs.build_env }}" ]; then
+            while IFS= read -r item; do
+              name=$(echo "$item" | jq -r '.name')
+              value=$(echo "$item" | jq -r '.value')
+              BUILD_ENV_ARGS="$BUILD_ENV_ARGS --build-arg $name=$value"
+            done < <(echo '${{ inputs.build_env }}' | jq -c '.[]')
+          fi
+          docker build ${{ inputs.build_args }} $BUILD_ENV_ARGS \
+            -t ${{ env.ECR_REPOSITORY }}:${{ inputs.image_prefix }}-${ENV_TAG}-${{ github.sha }} \
+            -f ${{ inputs.build_directory }}/${{ inputs.dockerfile }} \
+            ${{ inputs.context_directory }}
+          docker push ${{ env.ECR_REPOSITORY }}:${{ inputs.image_prefix }}-${ENV_TAG}-${{ github.sha }}
+          echo "image_uri=${{ env.ECR_REPOSITORY }}:${{ inputs.image_prefix }}-${ENV_TAG}-${{ github.sha }}" >> $GITHUB_OUTPUT
+        else
+          echo "Using existing image..."
+          echo "image_uri=${{ steps.check-image.outputs.latest_image_uri }}" >> $GITHUB_OUTPUT
+        fi 
