@@ -1,0 +1,52 @@
+[
+    {
+        "name": "section1",
+        "type": "sectionHeader", // H2
+        "label": "User Information"
+    },
+  {
+    "name": "firstname",
+    "type": "text",
+    "label": "First Name", // H6?
+    "holder": "Enter your first name",
+    "requiredErrorMessage": "Please enter your first name exactly as it appears on your official documents.",
+    "required": true
+  },
+  {
+    "name": "hasnickname",
+    "type": "radioButton",
+    "label": "Do you have a nickname?",
+    "requiredErrorMessage": "Please indicate whether you have a nickname.",
+    "options": [
+      {
+        "label": "Yes",
+        "value": "Y"
+      }
+    ],
+    "required": true
+  },
+  {
+    "name": "noMiddleName",
+    "type": "checkBox",
+    "label": "Does not apply to Middle Name",
+    "requiredErrorMessage": "Please indicate if Middle Name applies.",
+    "required": true
+  },
+  {
+    "name": "othercountryofcitizenship",
+    "type": "select",
+    "label": "Other Country of Citizenship",
+    "holder": "Select",
+    "options": [
+      {
+        "label": "United States",
+        "value": "US"
+      },
+      {
+        "label": "Canada",
+        "value": "CA"
+      }
+    ],
+    "required": false
+  }
+]
